@@ -1,0 +1,10 @@
+# kubectl apply -k apps/loadgen
+# The Java source is shipped as a ConfigMap and run with the JDK's single-file source launcher
+# (`java LoadGen.java`), so there is no image to build.
+namespace: petclinic
+resources:
+  - loadgen.yaml
+configMapGenerator:
+  - name: loadgen-src
+    files:
+      - LoadGen.java

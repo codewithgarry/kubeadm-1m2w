@@ -1,0 +1,199 @@
+# OpenTelemetry Collector (gateway) - receives OTLP from the Java agents and fans out:
+#   traces  -> Tempo (OTLP gRPC)            + spanmetrics / servicegraph connectors
+#   metrics -> Prometheus exporter :8889    (scraped by your existing Prometheus via ServiceMonitor)
+#   logs    -> Loki native OTLP endpoint    (trace_id/span_id kept as structured metadata)
+# Chart: open-telemetry/opentelemetry-collector 0.174.0  (collector-contrib 0.161.0)
+mode: deployment
+fullnameOverride: otel-collector   # Service = otel-collector.observability:4317/4318
+replicaCount: 1
+
+image:
+  repository: otel/opentelemetry-collector-contrib   # contrib = has k8sattributes, spanmetrics, loki-compatible exporters
+
+# Adds the k8sattributes processor + the RBAC it needs (pods/namespaces/replicasets read).
+presets:
+  kubernetesAttributes:
+    enabled: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 192Mi
+  limits:
+    memory: 512Mi
+
+ports:
+  jaeger-compact:
+    enabled: false
+  jaeger-thrift:
+    enabled: false
+  jaeger-grpc:
+    enabled: false
+  zipkin:
+    enabled: false
+  metrics:                       # collector's own telemetry (otelcol_* metrics)
+    enabled: true
+  prom-app:                      # application metrics re-exposed for Prometheus
+    enabled: true
+    containerPort: 8889
+    servicePort: 8889
+    protocol: TCP
+
+# Prometheus (release=monitoring) picks this up; no change to the existing install.
+serviceMonitor:
+  enabled: true
+  extraLabels:
+    release: monitoring
+  metricsEndpoints:
+    - port: metrics              # the collector's own health: otelcol_receiver_accepted_*, otelcol_exporter_sent_*, queue sizes
+      interval: 30s
+      relabelings:
+        - {targetLabel: telemetry_source, replacement: otel-collector-self}
+    - port: prom-app             # application telemetry pushed by the Java agents (OTLP) and span-derived metrics
+      interval: 15s
+      honorLabels: true          # keep job/instance derived from service.name/service.instance.id
+      relabelings:
+        - {targetLabel: telemetry_source, replacement: otel}
+      # namespace/pod/container/service/endpoint would describe the *collector* pod, not the app.
+      # The app's real location is in k8s_namespace_name / k8s_pod_name / k8s_node_name.
+      metricRelabelings:
+        - {action: labeldrop, regex: "namespace|pod|container|service|endpoint"}
+
+# alternateConfig REPLACES the chart's default config instead of merging with it,
+# so the pipelines below are exactly what runs (plus the k8sattributes preset).
+alternateConfig:
+  extensions:
+    health_check:
+      endpoint: ${env:MY_POD_IP}:13133
+
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: ${env:MY_POD_IP}:4317
+        http:
+          endpoint: ${env:MY_POD_IP}:4318
+
+  processors:
+    memory_limiter:              # always first: refuse data before the pod OOMs
+      check_interval: 2s
+      limit_percentage: 80
+      spike_limit_percentage: 20
+    k8sattributes:               # enriches with k8s.namespace.name, k8s.pod.name, k8s.node.name, k8s.deployment.name
+      passthrough: false
+      pod_association:
+        - sources: [{from: resource_attribute, name: k8s.pod.ip}]
+        - sources: [{from: resource_attribute, name: k8s.pod.uid}]
+        - sources: [{from: connection}]
+      extract:
+        metadata: [k8s.namespace.name, k8s.pod.name, k8s.pod.uid, k8s.node.name, k8s.deployment.name]
+    # kubelet probes hit /actuator/health every few seconds - that is noise, not user traffic.
+    # Dropped before span_metrics so they don't distort request rate or latency either.
+    filter/drop_probes:
+      error_mode: ignore
+      traces:
+        span:
+          - IsMatch(attributes["url.path"], "^/actuator")
+    # java.util.logging (Tomcat) says SEVERE/WARNING, logback says ERROR/WARN. Normalise the text from
+    # the numeric OTel severity so one Loki filter (and Grafana's level colours) works for both.
+    transform/log_severity:
+      error_mode: ignore
+      log_statements:
+        - context: log
+          statements:
+            - set(log.severity_text, "ERROR") where log.severity_number >= SEVERITY_NUMBER_ERROR and log.severity_number < SEVERITY_NUMBER_FATAL
+            - set(log.severity_text, "WARN") where log.severity_number >= SEVERITY_NUMBER_WARN and log.severity_number < SEVERITY_NUMBER_ERROR
+    batch:
+      send_batch_size: 1024
+      timeout: 5s
+
+  connectors:
+    # RED metrics derived from spans (every span, incl. DB client spans).
+    span_metrics:
+      namespace: traces.span.metrics
+      histogram:
+        unit: s
+        explicit:
+          buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s, 10s]
+      dimensions:
+        - name: http.request.method
+        - name: http.response.status_code
+        - name: http.route
+        - name: db.system.name     # DB client spans are already named by db.query.summary ("select owners")
+      events:                    # counts span events -> exception counter by type
+        enabled: true
+        dimensions:
+          - name: exception.type
+      metrics_flush_interval: 15s
+      aggregation_temporality: AGGREGATION_TEMPORALITY_CUMULATIVE
+    # client->server edges for Grafana's service map (loadgen -> petclinic -> postgresql)
+    service_graph:
+      latency_histogram_buckets: [10ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s]
+      dimensions: [http.request.method]
+      database_name_attributes: [db.system.name]   # DB node = "postgresql" (db.namespace would be "petclinic|petclinic")
+      store:
+        ttl: 10s                 # how long a client span waits for its matching server span
+        max_items: 1000
+      metrics_flush_interval: 15s
+
+  exporters:
+    otlp/tempo:
+      endpoint: tempo.observability.svc.cluster.local:4317
+      tls:
+        insecure: true
+      sending_queue:
+        enabled: true
+        queue_size: 2000
+      retry_on_failure:
+        enabled: true
+    otlphttp/loki:
+      endpoint: http://loki.observability.svc.cluster.local:3100/otlp
+      sending_queue:
+        enabled: true
+        queue_size: 2000
+      retry_on_failure:
+        enabled: true
+    prometheus:
+      endpoint: ${env:MY_POD_IP}:8889
+      translation_strategy: UnderscoreEscapingWithSuffixes   # jvm.memory.used -> jvm_memory_used_bytes
+      # Only these resource attributes become Prometheus labels. The Java agent sends many more
+      # (process.command_args, os.*, telemetry.sdk.*) - those stay in target_info only, keeping cardinality low.
+      # service.name/service.namespace -> "job", service.instance.id -> "instance" (automatic).
+      resource_constant_labels:
+        included:
+          - service.name
+          - service.namespace
+          - service.version
+          - deployment.environment.name
+          - k8s.namespace.name
+          - k8s.pod.name
+          - k8s.node.name
+          - k8s.deployment.name
+      enable_open_metrics: false
+      metric_expiration: 10m
+    debug:
+      verbosity: detailed        # not wired into any pipeline; add it to one temporarily to print data to the pod log
+
+  service:
+    extensions: [health_check]
+    telemetry:
+      metrics:
+        readers:
+          - pull:
+              exporter:
+                prometheus:
+                  host: ${env:MY_POD_IP}
+                  port: 8888
+    pipelines:
+      traces:
+        receivers: [otlp]
+        processors: [memory_limiter, filter/drop_probes, k8sattributes, batch]
+        exporters: [otlp/tempo, span_metrics, service_graph]
+      metrics:
+        receivers: [otlp, span_metrics, service_graph]
+        processors: [memory_limiter, k8sattributes, batch]
+        exporters: [prometheus]
+      logs:
+        receivers: [otlp]
+        processors: [memory_limiter, k8sattributes, transform/log_severity, batch]
+        exporters: [otlphttp/loki]

@@ -1,0 +1,168 @@
+# Spring PetClinic (Spring Boot 4.1, Spring Data JPA/Hibernate, Thymeleaf, PostgreSQL) instrumented
+# with the OpenTelemetry Java agent - zero code changes, configured purely through env vars.
+#
+# Runtime: the official eclipse-temurin 21 JRE image runs the jar that apps/petclinic-build.yaml
+# compiled from the official source onto the "petclinic-app" PVC (see that file for why).
+#
+# Agent: copied from the OTel Operator's autoinstrumentation image by an initContainer
+# (same jar as the GitHub release, but pulled from a registry - no internet download at runtime)
+# and attached with -javaagent via JAVA_TOOL_OPTIONS.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: petclinic-otel
+  namespace: petclinic
+data:
+  # --- where to send telemetry -------------------------------------------------
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.observability.svc.cluster.local:4318"
+  OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf"
+  OTEL_TRACES_EXPORTER: "otlp"
+  OTEL_METRICS_EXPORTER: "otlp"
+  OTEL_LOGS_EXPORTER: "otlp"            # logback records -> OTLP, with trace_id/span_id attached
+  OTEL_METRIC_EXPORT_INTERVAL: "15000"  # ms
+  # --- sampling: keep everything (lab). Production would use parentbased_traceidratio. ---
+  OTEL_TRACES_SAMPLER: "parentbased_always_on"
+  OTEL_PROPAGATORS: "tracecontext,baggage"
+  # --- semantic conventions: stable DB conventions -> db.system.name, db.query.text,
+  #     db.operation.name, db.collection.name + the db.client.operation.duration histogram
+  OTEL_SEMCONV_STABILITY_OPT_IN: "database"
+  # --- extra JVM metrics (buffer pools, system CPU, memory.init) ---
+  OTEL_INSTRUMENTATION_RUNTIME_TELEMETRY_EMIT_EXPERIMENTAL_METRICS: "true"
+  # --- logs: thread name + code location on every record; exceptions become exception.* attributes
+  OTEL_INSTRUMENTATION_LOGBACK_APPENDER_EXPERIMENTAL_LOG_ATTRIBUTES: "true"
+  OTEL_INSTRUMENTATION_LOGBACK_APPENDER_EXPERIMENTAL_CAPTURE_CODE_ATTRIBUTES: "true"
+  # --- record the load generator's scenario header on server spans (searchable in Tempo)
+  OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS: "x-lab-scenario"
+  # --- JDBC: keep bind values out of spans (default, shown for clarity) ---
+  OTEL_INSTRUMENTATION_COMMON_DB_QUERY_SANITIZATION_ENABLED: "true"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: petclinic
+  namespace: petclinic
+  labels:
+    app.kubernetes.io/name: petclinic
+spec:
+  type: LoadBalancer                     # MetalLB hands out an IP from lab-pool -> open it in your browser
+  selector:
+    app.kubernetes.io/name: petclinic
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: petclinic
+  namespace: petclinic
+  labels:
+    app.kubernetes.io/name: petclinic
+    app.kubernetes.io/part-of: observability-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: petclinic
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: petclinic
+        app.kubernetes.io/part-of: observability-lab
+    spec:
+      initContainers:
+        - name: wait-for-jar          # the build Job must have finished once
+          image: docker.io/library/eclipse-temurin:21-jre
+          command: ["bash", "-c", "until [ -s /app/petclinic.jar ]; do echo waiting for petclinic-build job; sleep 10; done; echo built from commit $(cat /app/REF)"]
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 64Mi}
+          volumeMounts:
+            - {name: app, mountPath: /app, readOnly: true}
+        - name: otel-agent
+          image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-java:2.31.1
+          command: ["cp", "/javaagent.jar", "/otel-agent/opentelemetry-javaagent.jar"]
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 64Mi}
+          volumeMounts:
+            - name: otel-agent
+              mountPath: /otel-agent
+      containers:
+        - name: petclinic
+          image: docker.io/library/eclipse-temurin:21-jre
+          command: ["java", "-jar", "/app/petclinic.jar"]
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: petclinic-otel
+          env:
+            # ---------- application ----------
+            - name: SPRING_PROFILES_ACTIVE
+              value: postgres
+            - name: POSTGRES_URL                  # through toxiproxy so DB faults can be injected
+              value: jdbc:postgresql://toxiproxy.petclinic.svc.cluster.local:5432/petclinic
+            - name: POSTGRES_USER
+              valueFrom: {secretKeyRef: {name: petclinic-db, key: POSTGRES_USER}}
+            - name: POSTGRES_PASS
+              valueFrom: {secretKeyRef: {name: petclinic-db, key: POSTGRES_PASSWORD}}
+            - name: SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE
+              value: "10"
+            - name: SPRING_DATASOURCE_HIKARI_CONNECTION_TIMEOUT   # fail after 5s instead of 30s when the DB hangs
+              value: "5000"
+            # trace/span ids in the *console* log line too (the agent puts them in the logback MDC),
+            # so `kubectl logs` output can be matched to a trace by hand
+            - name: LOGGING_PATTERN_LEVEL
+              value: "%5p [trace_id=%X{trace_id:-} span_id=%X{span_id:-}]"
+            # ---------- JVM ----------
+            # G1 explicitly: with <2 CPUs / <1792 MB visible, the JVM would silently pick SerialGC
+            - name: JAVA_TOOL_OPTIONS
+              value: "-javaagent:/otel-agent/opentelemetry-javaagent.jar -XX:+UseG1GC -XX:MaxRAMPercentage=55 -XX:+ExitOnOutOfMemoryError"
+            - name: MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED    # /actuator/health/{liveness,readiness}
+              value: "true"
+            # ---------- OpenTelemetry resource ----------
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: OTEL_SERVICE_NAME
+              value: petclinic
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "service.namespace=petclinic-lab,service.version=4.0.0-SNAPSHOT,deployment.environment.name=lab,k8s.pod.ip=$(POD_IP),k8s.container.name=petclinic"
+          startupProbe:                            # agent + Spring on 2 vCPU needs ~60-120 s
+            httpGet: {path: /actuator/health/liveness, port: http}
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet: {path: /actuator/health/liveness, port: http}
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: {path: /actuator/health/readiness, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 640Mi
+            limits:
+              cpu: "1500m"
+              memory: 800Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
+          volumeMounts:
+            - name: otel-agent
+              mountPath: /otel-agent
+              readOnly: true
+            - name: app
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: otel-agent
+          emptyDir: {}
+        - name: app
+          persistentVolumeClaim:
+            claimName: petclinic-app

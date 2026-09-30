@@ -1,0 +1,87 @@
+# Builds Spring PetClinic from the official source into a PVC - run once.
+#
+# Why not a prebuilt image? This cluster is arm64. On Docker Hub,
+#   springcommunity/spring-petclinic:latest / 3.5.6  -> amd64 only
+#   springcommunity/spring-petclinic:3.5.0 (arm64)   -> a GraalVM *native image*: no JVM, so the
+#                                                      OpenTelemetry Java agent cannot attach.
+# So: official source (pinned commit) + official Maven image -> plain JVM jar -> run on the
+# official eclipse-temurin JRE (apps/petclinic.yaml). No registry and no custom image needed.
+#
+# Re-build (e.g. new commit): change PETCLINIC_REF, then
+#   kubectl -n petclinic delete job petclinic-build && kubectl apply -f apps/petclinic-build.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: petclinic-app
+  namespace: petclinic
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: petclinic-build
+  namespace: petclinic
+  labels:
+    app.kubernetes.io/name: petclinic-build
+    app.kubernetes.io/part-of: observability-lab
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: petclinic-build
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: fetch-source
+          image: docker.io/curlimages/curl:8.16.0
+          env:
+            - name: PETCLINIC_REF     # spring-projects/spring-petclinic main @ 2026-09-29 (Spring Boot 4.1.0)
+              value: 500158f732419217507c7656904b8e6aa1bcc0d6
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              curl -fsSL "https://github.com/spring-projects/spring-petclinic/archive/${PETCLINIC_REF}.tar.gz" | tar -xz -C /src --strip-components=1
+              echo "$PETCLINIC_REF" > /src/REF
+              ls /src
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          volumeMounts:
+            - {name: src, mountPath: /src}
+      containers:
+        - name: maven
+          image: docker.io/library/maven:3.9-eclipse-temurin-21
+          workingDir: /src
+          env:
+            - name: MAVEN_OPTS
+              value: "-Xmx640m"
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              # style/coverage/SBOM checks are irrelevant for a lab build and slow on 2 vCPU
+              mvn -B -ntp -DskipTests -Dcheckstyle.skip -Dspring-javaformat.skip=true -Djacoco.skip=true -Dcyclonedx.skip=true package
+              cp target/spring-petclinic-*.jar /app/petclinic.jar.tmp
+              mv /app/petclinic.jar.tmp /app/petclinic.jar
+              cp REF /app/REF
+              ls -l /app
+          resources:
+            requests: {cpu: 500m, memory: 768Mi}
+            limits: {memory: 1Gi}
+          volumeMounts:
+            - {name: src, mountPath: /src}
+            - {name: app, mountPath: /app}
+      volumes:
+        - name: src
+          emptyDir: {}
+        - name: app
+          persistentVolumeClaim:
+            claimName: petclinic-app

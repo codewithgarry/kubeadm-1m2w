@@ -1,0 +1,34 @@
+# Grafana Tempo - single binary, local filesystem backend on a PVC.
+# Chart: grafana-community/tempo 3.0.0  (Tempo 3.0.3)
+#
+# Traces arrive ONLY from the OpenTelemetry Collector (OTLP gRPC :4317).
+# (The chart templates require its default Jaeger receivers; they stay but are unused.)
+tempo:
+  reportingEnabled: false
+  retention: 72h                 # same 3 days as Prometheus / Loki
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+  # Span metrics / service graph are produced by the OTel Collector (connectors),
+  # so Tempo's metrics-generator stays OFF: it would need Prometheus remote-write,
+  # which your existing Prometheus does not have enabled.
+  metricsGenerator:
+    enabled: false
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+  extraEnv:
+    - name: GOMEMLIMIT
+      value: 850MiB
+
+persistence:
+  enabled: true
+  size: 5Gi
+  storageClassName: local-path

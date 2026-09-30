@@ -1,0 +1,16 @@
+# observability : OTel Collector, Loki, Tempo, Alloy (the telemetry pipeline + backends)
+# petclinic     : the Java app under test, its database, a DB fault-injection proxy, a load generator
+# Prometheus/Grafana stay where they are (namespace "monitoring", Helm release "monitoring").
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+  labels:
+    app.kubernetes.io/part-of: observability-lab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: petclinic
+  labels:
+    app.kubernetes.io/part-of: observability-lab

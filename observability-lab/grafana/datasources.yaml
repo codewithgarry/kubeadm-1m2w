@@ -1,0 +1,93 @@
+# Loki + Tempo datasources for the EXISTING Grafana (kube-prometheus-stack, release "monitoring").
+# Grafana's datasource sidecar watches ConfigMaps labelled grafana_datasource=1 in namespace
+# "monitoring" and hot-reloads them - no Helm upgrade of kube-prometheus-stack needed.
+# The existing "Prometheus" datasource (uid: prometheus) is referenced, not redefined.
+#
+# NOTE: Grafana expands $VAR / ${VAR} env vars in provisioning files, so Grafana's own
+#       template macros are written as $${...} to survive that step.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: observability-lab-datasources
+  namespace: monitoring
+  labels:
+    grafana_datasource: "1"
+    app.kubernetes.io/part-of: observability-lab
+data:
+  observability-lab-datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      # ------------------------------------------------------------------ Loki
+      - name: Loki
+        uid: loki
+        type: loki
+        access: proxy
+        url: http://loki.observability.svc.cluster.local:3100
+        jsonData:
+          maxLines: 1000
+          timeout: 60
+          derivedFields:
+            # OTLP logs (petclinic, loadgen): trace_id is structured metadata -> "View trace" button
+            - name: TraceID
+              matcherType: label
+              matcherRegex: trace_id
+              datasourceUid: tempo
+              url: "$${__value.raw}"
+              urlDisplayLabel: View trace in Tempo
+            # console-format lines ("... [trace_id=abc span_id=def] ...") e.g. from kubectl-style logs
+            - name: TraceID (log line)
+              matcherType: regex
+              matcherRegex: "trace_id=(\\w{32})"
+              datasourceUid: tempo
+              url: "$${__value.raw}"
+              urlDisplayLabel: View trace in Tempo
+
+      # ----------------------------------------------------------------- Tempo
+      - name: Tempo
+        uid: tempo
+        type: tempo
+        access: proxy
+        url: http://tempo.observability.svc.cluster.local:3200
+        jsonData:
+          # Trace -> Logs: all logs of every service in this trace, matched on trace_id
+          # (structured metadata written by Loki's OTLP endpoint).
+          tracesToLogsV2:
+            datasourceUid: loki
+            spanStartTimeShift: "-5m"
+            spanEndTimeShift: "5m"
+            customQuery: true
+            query: '{service_namespace="petclinic-lab"} | trace_id="$${__trace.traceId}"'
+          # Trace -> Metrics: RED metrics of the span's service / operation (from span_metrics connector)
+          tracesToMetrics:
+            datasourceUid: prometheus
+            spanStartTimeShift: "-10m"
+            spanEndTimeShift: "10m"
+            tags:
+              - key: service.name
+                value: service_name
+            queries:
+              - name: Request rate (this operation)
+                query: 'sum(rate(traces_span_metrics_calls_total{$$__tags, span_name="$${__span.name}"}[1m]))'
+              - name: Error rate (this operation)
+                query: 'sum(rate(traces_span_metrics_calls_total{$$__tags, span_name="$${__span.name}", status_code="STATUS_CODE_ERROR"}[1m]))'
+              - name: P95 latency (this operation)
+                query: 'histogram_quantile(0.95, sum by (le) (rate(traces_span_metrics_duration_seconds_bucket{$$__tags, span_name="$${__span.name}"}[1m])))'
+          # Service map from the service_graph connector's traces_service_graph_* metrics
+          serviceMap:
+            datasourceUid: prometheus
+          nodeGraph:
+            enabled: true
+          search:
+            hide: false
+          lokiSearch:
+            datasourceUid: loki
+          traceQuery:
+            timeShiftEnabled: true
+            spanStartTimeShift: "-30m"
+            spanEndTimeShift: "30m"
+          spanBar:
+            type: Tag
+            tag: http.route
+          streamingEnabled:
+            search: false
+            metrics: false

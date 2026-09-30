@@ -1,0 +1,79 @@
+# MySQL for PrestaShop.
+# Passwords live in the Secret "mysql-secret" (created with kubectl, not stored in this file):
+#   kubectl create secret generic mysql-secret \
+#     --from-literal=root-password='<root-pass>' --from-literal=password='<app-pass>'
+# PrestaShop installer: server = mysql, database = prestashop, login = prestashop,
+#   password = kubectl get secret mysql-secret -o jsonpath='{.data.password}' | base64 -d
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  labels:
+    app: mysql
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate            # never two MySQL pods on the same data volume
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:8.4
+        ports:
+        - containerPort: 3306
+          name: mysql
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: mysql-secret, key: root-password}
+        - name: MYSQL_DATABASE
+          value: prestashop
+        - name: MYSQL_USER
+          value: prestashop
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: mysql-secret, key: password}
+        resources:
+          requests: {cpu: 100m, memory: 400Mi}
+          limits: {memory: 1Gi}
+        readinessProbe:
+          exec:
+            command: ["sh", "-c", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$MYSQL_ROOT_PASSWORD\""]
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: mysql-data
+---
+# ClusterIP only: the DB is reached from PrestaShop pods as "mysql:3306", never from outside
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+spec:
+  selector:
+    app: mysql
+  ports:
+  - name: mysql
+    port: 3306
+    targetPort: mysql

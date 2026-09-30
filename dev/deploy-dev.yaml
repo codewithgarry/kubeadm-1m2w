@@ -1,0 +1,45 @@
+# PrestaShop web files live on a PVC, not the container's overlay filesystem:
+#  - the installer renames admin/ -> admin<random>/, which fails on overlayfs
+#    ("Invalid cross-device link"); on a real volume it works
+#  - the installed store (config, uploads, modules) survives pod restarts
+# On first start the image copies its files into the empty volume (/tmp/data-ps/prestashop).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prestashop-html
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 3Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+  labels:
+    app: nginx
+spec:
+  replicas: 1   # ReadWriteOnce volume: one pod only
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: prestashop/prestashop:latest
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: html
+          mountPath: /var/www/html
+      volumes:
+      - name: html
+        persistentVolumeClaim:
+          claimName: prestashop-html

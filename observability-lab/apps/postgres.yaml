@@ -1,0 +1,101 @@
+# PostgreSQL 17 for Spring PetClinic (profile "postgres").
+# PetClinic creates its own schema + sample data on startup (spring.sql.init.mode=always),
+# so the DB only needs an empty "petclinic" database and a user.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: petclinic-db
+  namespace: petclinic
+type: Opaque
+stringData:
+  POSTGRES_DB: petclinic
+  POSTGRES_USER: petclinic
+  POSTGRES_PASSWORD: petclinic-lab-pw   # lab only - rotate / use an external secret store for anything real
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: petclinic
+  labels:
+    app.kubernetes.io/name: postgres
+spec:
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: petclinic
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: observability-lab
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: observability-lab
+    spec:
+      securityContext:
+        fsGroup: 70                     # "postgres" group in the alpine image
+      containers:
+        - name: postgres
+          image: docker.io/library/postgres:17-alpine
+          # log every statement slower than 200 ms -> appears in Loki (via Alloy) next to the trace's DB span
+          args:
+            - "-c"
+            - "log_min_duration_statement=200"
+            - "-c"
+            - "log_line_prefix=%m [%p] %u@%d "
+            - "-c"
+            - "shared_preload_libraries=pg_stat_statements"
+            - "-c"
+            - "pg_stat_statements.track=all"
+          envFrom:
+            - secretRef:
+                name: petclinic-db
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 384Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 2Gi
